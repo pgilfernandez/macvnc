@@ -29,6 +29,7 @@
 
 #include <Carbon/Carbon.h>
 #include <ScreenCaptureKit/ScreenCaptureKit.h>
+#include <IOSurface/IOSurface.h>
 #include <rfb/rfb.h>
 #include <rfb/keysym.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
@@ -36,6 +37,7 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 #import "ScreenCapturer.h"
 
@@ -71,6 +73,10 @@ static rfbBool initialized            = FALSE;
 static rfbBool dim_time_saved         = FALSE;
 static rfbBool sleep_time_saved       = FALSE;
 
+/* Keep screen capturer alive for the life of the server */
+static ScreenCapturer *screenCapturer = nil;
+/* CGDisplayStream for legacy (Monterey) capture */
+static CGDisplayStreamRef displayStream = NULL;
 /* a dictionary mapping characters to keycodes */
 CFMutableDictionaryRef charKeyMap;
 
@@ -562,8 +568,93 @@ ScreenInit(int argc, char**argv)
   rfbScreen->ptrAddEvent = PtrAddEvent;
   rfbScreen->kbdAddEvent = KbdAddEvent;
 
-  ScreenCapturer *capturer = [[ScreenCapturer alloc] initWithDisplay: displayID
-                                                        frameHandler:^(CMSampleBufferRef sampleBuffer) {
+  /* Check macOS version - use CGDisplayStream for Monterey (12.x), ScreenCaptureKit for 13+ */
+  NSOperatingSystemVersion version = [[NSProcessInfo processInfo] operatingSystemVersion];
+  BOOL useLegacyCapture = (version.majorVersion < 13);
+
+  if (useLegacyCapture) {
+      NSLog(@"[mac.m] macOS version %ld.%ld detected - using CGDisplayStream (legacy mode)",
+            (long)version.majorVersion, (long)version.minorVersion);
+
+      /* Use CGDisplayStream for Monterey and earlier */
+      dispatch_queue_t dispatchQueue = dispatch_queue_create("libvncserver.examples.mac", NULL);
+
+      displayStream = CGDisplayStreamCreateWithDispatchQueue(displayID,
+                                                                         CGDisplayPixelsWide(displayID),
+                                                                         CGDisplayPixelsHigh(displayID),
+                                                                         'BGRA',
+                                                                         nil,
+                                                                         dispatchQueue,
+                                                                         ^(CGDisplayStreamFrameStatus status,
+                                                                           uint64_t displayTime,
+                                                                           IOSurfaceRef frameSurface,
+                                                                           CGDisplayStreamUpdateRef updateRef) {
+          if (status == kCGDisplayStreamFrameStatusFrameComplete && frameSurface != NULL) {
+              rfbClientIteratorPtr iterator;
+              rfbClientPtr cl;
+              const CGRect *updatedRects;
+              size_t updatedRectsCount;
+              size_t r;
+
+              /* Copy new frame to back buffer */
+              IOSurfaceLock(frameSurface, kIOSurfaceLockReadOnly, NULL);
+
+              memcpy(backBuffer,
+                     IOSurfaceGetBaseAddress(frameSurface),
+                     CGDisplayPixelsWide(displayID) * CGDisplayPixelsHigh(displayID) * 4);
+
+              IOSurfaceUnlock(frameSurface, kIOSurfaceLockReadOnly, NULL);
+
+              /* Lock out client reads */
+              iterator = rfbGetClientIterator(rfbScreen);
+              while((cl = rfbClientIteratorNext(iterator))) {
+                  LOCK(cl->sendMutex);
+              }
+              rfbReleaseClientIterator(iterator);
+
+              /* Swap framebuffers */
+              if (backBuffer == frameBufferOne) {
+                  backBuffer = frameBufferTwo;
+                  rfbScreen->frameBuffer = frameBufferOne;
+              } else {
+                  backBuffer = frameBufferOne;
+                  rfbScreen->frameBuffer = frameBufferTwo;
+              }
+
+              /* Mark modified rects in new framebuffer */
+              updatedRects = CGDisplayStreamUpdateGetRects(updateRef, kCGDisplayStreamUpdateDirtyRects, &updatedRectsCount);
+              for(r = 0; r < updatedRectsCount; ++r) {
+                  rfbMarkRectAsModified(rfbScreen,
+                                       updatedRects[r].origin.x,
+                                       updatedRects[r].origin.y,
+                                       updatedRects[r].origin.x + updatedRects[r].size.width,
+                                       updatedRects[r].origin.y + updatedRects[r].size.height);
+              }
+
+              /* Reenable client reads */
+              iterator = rfbGetClientIterator(rfbScreen);
+              while((cl = rfbClientIteratorNext(iterator))) {
+                  UNLOCK(cl->sendMutex);
+              }
+              rfbReleaseClientIterator(iterator);
+          }
+      });
+
+      CGDisplayStreamStart(displayStream);
+      NSLog(@"[mac.m] CGDisplayStream started successfully");
+
+  } else {
+      NSLog(@"[mac.m] macOS version %ld.%ld detected - using ScreenCaptureKit (modern mode)",
+            (long)version.majorVersion, (long)version.minorVersion);
+
+      /* Use ScreenCaptureKit for Ventura and later */
+      screenCapturer = [[ScreenCapturer alloc] initWithDisplay: displayID
+                                              frameHandler:^(CMSampleBufferRef sampleBuffer) {
+          static int frameHandlerCallCount = 0;
+          if (frameHandlerCallCount++ < 3) {
+              NSLog(@"[mac.m] frameHandler called #%d", frameHandlerCallCount);
+          }
+
           rfbClientIteratorPtr iterator;
           rfbClientPtr cl;
 
@@ -571,14 +662,26 @@ ScreenInit(int argc, char**argv)
              Copy new frame to back buffer.
            */
           CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-          if(!pixelBuffer)
+          if(!pixelBuffer) {
+              NSLog(@"[mac.m] ERROR: pixelBuffer is NULL!");
               return;
+          }
 
           CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
 
-          memcpy(backBuffer,
-                 CVPixelBufferGetBaseAddress(pixelBuffer),
-                 CGDisplayPixelsWide(displayID) *  CGDisplayPixelsHigh(displayID) * 4);
+          size_t pixelWidth = CGDisplayPixelsWide(displayID);
+          size_t pixelHeight = CGDisplayPixelsHigh(displayID);
+          size_t dstBytesPerRow = pixelWidth * 4;
+          size_t srcBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer);
+          uint8_t *dstBase = backBuffer;
+          uint8_t *srcBase = CVPixelBufferGetBaseAddress(pixelBuffer);
+
+          size_t copyBytesPerRow = dstBytesPerRow < srcBytesPerRow ? dstBytesPerRow : srcBytesPerRow;
+          for (size_t row = 0; row < pixelHeight; row++) {
+              memcpy(dstBase + row * dstBytesPerRow,
+                     srcBase + row * srcBytesPerRow,
+                     copyBytesPerRow);
+          }
 
           CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
 
@@ -620,7 +723,8 @@ ScreenInit(int argc, char**argv)
           //TODO handle other errors
           exit(EXIT_FAILURE);
       }];
-  [capturer startCapture];
+      [screenCapturer startCapture];
+  }
 
   rfbInitServer(rfbScreen);
 

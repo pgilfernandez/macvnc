@@ -38,8 +38,11 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
 
 #import "ScreenCapturer.h"
+#import "../macvnc.h"
 
 /* The main LibVNCServer screen object */
 rfbScreenInfoPtr rfbScreen;
@@ -745,6 +748,7 @@ enum rfbNewClientAction newClient(rfbClientPtr cl)
   return(RFB_CLIENT_ACCEPT);
 }
 
+#ifndef MACVNC_BUILD_LIBRARY
 int main(int argc,char *argv[])
 {
   int i;
@@ -800,4 +804,215 @@ void serverShutdown(rfbClientPtr cl)
   rfbScreenCleanup(rfbScreen);
   dimmingShutdown();
   exit(0);
+}
+
+
+#endif // MACVNC_BUILD_LIBRARY
+
+
+//
+// Library API
+//
+
+static bool macvnc_running = false;
+static pthread_t macvnc_thread;
+static char macvnc_last_error[512] = {0};
+static char* macvnc_passwords[2] = {NULL, NULL};
+
+static void macvnc_set_error(const char* msg)
+{
+	snprintf(macvnc_last_error, sizeof(macvnc_last_error), "%s", msg ? msg : "" );
+}
+
+static void* macvnc_event_loop(void* /*unused*/)
+{
+	while( macvnc_running && rfbScreen && rfbIsActive( rfbScreen ) )
+	{
+		rfbProcessEvents( rfbScreen, 100000 );
+	}
+
+	return NULL;
+}
+
+
+void macvnc_default_options( macvnc_options_t* options )
+{
+	if( options == NULL )
+	{
+		return;
+	}
+
+	options->port = 5900;
+	options->password = NULL;
+	options->view_only = false;
+	options->prevent_dimming = false;
+	options->prevent_sleep = true;
+	options->display = -1;
+}
+
+
+static void macvnc_apply_options( const macvnc_options_t* options )
+{
+	viewOnly = options->view_only ? TRUE : FALSE;
+	preventDimming = options->prevent_dimming ? TRUE : FALSE;
+	preventSleep = options->prevent_sleep ? TRUE : FALSE;
+	displayNumber = options->display;
+}
+
+
+bool macvnc_start( const macvnc_options_t* options, char* error_buffer, size_t error_buffer_size )
+{
+	if( macvnc_running )
+	{
+		return true;
+	}
+
+	macvnc_set_error( NULL );
+
+	macvnc_options_t local_options;
+	if( options == NULL )
+	{
+		macvnc_default_options( &local_options );
+		options = &local_options;
+	}
+
+	macvnc_apply_options( options );
+
+	if( dimmingInit() < 0 )
+	{
+		macvnc_set_error( "Could not initialise dimming control" );
+		goto error;
+	}
+
+	if( !keyboardInit() )
+	{
+		macvnc_set_error( "Could not initialise keyboard handling" );
+		goto error;
+	}
+
+	if( !ScreenInit( 0, NULL ) )
+	{
+		macvnc_set_error( "Could not initialise screen capture" );
+		goto error;
+	}
+
+	if( options->port > 0 )
+	{
+		rfbScreen->port = options->port;
+		rfbScreen->ipv6port = options->port;
+	}
+
+	rfbScreen->alwaysShared = TRUE;
+	rfbScreen->handleEventsEagerly = TRUE;
+	rfbScreen->deferUpdateTime = 5;
+
+	if( macvnc_passwords[0] )
+	{
+		free( macvnc_passwords[0] );
+		macvnc_passwords[0] = NULL;
+	}
+
+	if( options->password && options->password[0] != '\0' )
+	{
+		macvnc_passwords[0] = strdup( options->password );
+		macvnc_passwords[1] = NULL;
+		rfbScreen->authPasswdData = macvnc_passwords;
+		rfbScreen->passwordCheck = rfbCheckPasswordByList;
+	}
+	else
+	{
+		rfbScreen->authPasswdData = NULL;
+		rfbScreen->passwordCheck = NULL;
+	}
+
+	rfbInitServer( rfbScreen );
+
+	macvnc_running = true;
+
+	if( pthread_create( &macvnc_thread, NULL, macvnc_event_loop, NULL ) != 0 )
+	{
+		macvnc_set_error( "Failed to start server thread" );
+		goto error;
+	}
+
+	if( error_buffer && error_buffer_size > 0 )
+	{
+		error_buffer[0] = '\0';
+	}
+
+	return true;
+
+error:
+	if( error_buffer && error_buffer_size > 0 )
+	{
+		snprintf( error_buffer, error_buffer_size, "%s", macvnc_last_error );
+	}
+
+	macvnc_stop();
+	return false;
+}
+
+
+bool macvnc_is_running( void )
+{
+	return macvnc_running && rfbScreen && rfbIsActive( rfbScreen );
+}
+
+
+void macvnc_stop( void )
+{
+	if( macvnc_running )
+	{
+		macvnc_running = false;
+		pthread_join( macvnc_thread, NULL );
+	}
+
+	if( displayStream )
+	{
+		CGDisplayStreamStop( displayStream );
+		CFRelease( displayStream );
+		displayStream = NULL;
+	}
+
+	if( screenCapturer )
+	{
+		[screenCapturer stopCapture];
+		screenCapturer = nil;
+	}
+
+	if( rfbScreen )
+	{
+		rfbShutdownServer( rfbScreen, TRUE );
+		rfbScreenCleanup( rfbScreen );
+		rfbScreen = NULL;
+	}
+
+	if( frameBufferOne )
+	{
+		free( frameBufferOne );
+		frameBufferOne = NULL;
+	}
+
+	if( frameBufferTwo )
+	{
+		free( frameBufferTwo );
+		frameBufferTwo = NULL;
+	}
+
+	dimmingShutdown();
+
+	if( macvnc_passwords[0] )
+	{
+		free( macvnc_passwords[0] );
+		macvnc_passwords[0] = NULL;
+	}
+}
+
+
+void macvnc_get_last_error( char* buffer, size_t buffer_size )
+{
+	if( buffer && buffer_size > 0 )
+	{
+		snprintf( buffer, buffer_size, "%s", macvnc_last_error );
+	}
 }

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(macVNC VERSION 0.1.0 LANGUAGES C)
+project(macVNC VERSION 0.1.0 LANGUAGES C OBJC)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(CMAKE_GENERATOR MATCHES "Unix Makefiles|Ninja")
@@ -28,12 +28,24 @@ find_library(IOSURFACE IOSurface)
 #
 # Sources
 #
-set(SOURCE_FILES
+set(MACVNC_CODE
     src/ScreenCapturer.h
     src/ScreenCapturer.m
     src/mac.m
-    src/icon.icns
 )
+
+set(SOURCE_FILES ${MACVNC_CODE} src/icon.icns)
+
+add_library(macvnc_lib STATIC ${MACVNC_CODE})
+set_target_properties(macvnc_lib PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF UNITY_BUILD OFF)
+target_compile_definitions(macvnc_lib PRIVATE MACVNC_BUILD_LIBRARY)
+target_include_directories(macvnc_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(macvnc_lib PUBLIC LibVNCServer::vncserver ${CMAKE_THREAD_LIBS_INIT} ${CARBON_LIBRARY} ${IOKIT_LIBRARY}
+  ${SCREEN_CAPTURE_KIT}
+  ${CORE_MEDIA}
+  ${CORE_VIDEO}
+  ${FOUNDATION}
+  ${IOSURFACE})
 
 #
 # Build bundle
@@ -44,6 +56,7 @@ set(MACOSX_BUNDLE_ICON_FILE icon.icns)
 set_source_files_properties(src/icon.icns PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
 
 add_executable(${PROJECT_NAME} MACOSX_BUNDLE ${SOURCE_FILES})
+set_target_properties(${PROJECT_NAME} PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF UNITY_BUILD OFF)
 set_target_properties(${PROJECT_NAME} PROPERTIES
   MACOSX_BUNDLE_GUI_IDENTIFIER "net.libvnc.macvnc"
   MACOSX_BUNDLE_BUNDLE_NAME "macVNC"

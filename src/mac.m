@@ -42,6 +42,7 @@
 #include <string.h>
 
 #import "ScreenCapturer.h"
+#import "ScreenCaptureThread.h"
 #import "../macvnc.h"
 
 /* The main LibVNCServer screen object */
@@ -77,7 +78,7 @@ static rfbBool dim_time_saved         = FALSE;
 static rfbBool sleep_time_saved       = FALSE;
 
 /* Keep screen capturer alive for the life of the server */
-static ScreenCapturer *screenCapturer = nil;
+static ScreenCaptureThread *screenCaptureThread = nil;
 /* CGDisplayStream for legacy (Monterey) capture */
 static CGDisplayStreamRef displayStream = NULL;
 /* a dictionary mapping characters to keycodes */
@@ -651,8 +652,8 @@ ScreenInit(int argc, char**argv)
             (long)version.majorVersion, (long)version.minorVersion);
 
       /* Use ScreenCaptureKit for Ventura and later */
-      screenCapturer = [[ScreenCapturer alloc] initWithDisplay: displayID
-                                              frameHandler:^(CMSampleBufferRef sampleBuffer) {
+      screenCaptureThread = [[ScreenCaptureThread alloc] initWithDisplay: displayID
+                                                          frameHandler:^(CMSampleBufferRef sampleBuffer) {
           static int frameHandlerCallCount = 0;
           if (frameHandlerCallCount++ < 3) {
               NSLog(@"[mac.m] frameHandler called #%d", frameHandlerCallCount);
@@ -726,7 +727,10 @@ ScreenInit(int argc, char**argv)
           //TODO handle other errors
           exit(EXIT_FAILURE);
       }];
-      [screenCapturer startCapture];
+      if (![screenCaptureThread start]) {
+          NSLog(@"[mac.m] ERROR: failed to start ScreenCaptureThread");
+          return FALSE;
+      }
   }
 
   rfbInitServer(rfbScreen);
@@ -974,10 +978,10 @@ void macvnc_stop( void )
 		displayStream = NULL;
 	}
 
-	if( screenCapturer )
+	if( screenCaptureThread )
 	{
-		[screenCapturer stopCapture];
-		screenCapturer = nil;
+		[screenCaptureThread stop];
+		screenCaptureThread = nil;
 	}
 
 	if( rfbScreen )

@@ -29,6 +29,8 @@ find_library(IOSURFACE IOSurface)
 # Sources
 #
 set(MACVNC_CODE
+    src/ScreenCaptureThread.h
+    src/ScreenCaptureThread.m
     src/ScreenCapturer.h
     src/ScreenCapturer.m
     src/mac.m

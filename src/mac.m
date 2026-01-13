@@ -733,8 +733,6 @@ ScreenInit(int argc, char**argv)
       }
   }
 
-  rfbInitServer(rfbScreen);
-
   return TRUE;
 }
 
@@ -787,6 +785,7 @@ int main(int argc,char *argv[])
   if(!ScreenInit(argc,argv))
       exit(1);
   rfbScreen->newClientHook = newClient;
+  rfbInitServer(rfbScreen);
 
   rfbRunEventLoop(rfbScreen,-1,TRUE);
 
